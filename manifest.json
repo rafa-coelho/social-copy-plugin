@@ -1,0 +1,33 @@
+{
+  "manifest_version": 3,
+  "name": "Instagram Toolkit",
+  "version": "2.0",
+  "description": "Copy images, download videos and extract audio from Instagram",
+  "permissions": [
+    "contextMenus",
+    "activeTab",
+    "clipboardWrite",
+    "scripting",
+    "downloads"
+  ],
+  "host_permissions": [
+    "https://*.cdninstagram.com/*",
+    "https://*.fbcdn.net/*",
+    "https://www.instagram.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.instagram.com/*"],
+      "js": ["content.js"],
+      "css": ["styles.css"]
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
