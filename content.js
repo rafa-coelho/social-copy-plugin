@@ -8,6 +8,7 @@ if (window.__igToolkitCleanup) {
   let buttonContainer = null;
   let isDownloading = false;
   let intervalId = null;
+  let isTranscribing = false;
 
   // Cleanup function for re-injection
   window.__igToolkitCleanup = function() {
@@ -143,6 +144,70 @@ if (window.__igToolkitCleanup) {
   }
 
   // =====================
+  // WHISPER TRANSCRIPTION
+  // =====================
+  async function transcribeVideo(videoEl, vidIdx) {
+    if (isTranscribing) return;
+    isTranscribing = true;
+
+    try {
+      // Open the panel immediately with loading state
+      window.TranscriptPanel.create({ languages: [], selectedLang: "" });
+      window.TranscriptPanel.showLoading("Buscando áudio...");
+
+      // Extract media URLs
+      const media = await extractMediaUrls(vidIdx, videoEl);
+      if (!media) {
+        window.TranscriptPanel.showLoading("Não foi possível encontrar URLs de mídia");
+        setTimeout(() => window.TranscriptPanel.destroy(), 2000);
+        return;
+      }
+
+      const audioUrl = media.audioUrl || media.videoUrl;
+      if (!audioUrl) {
+        window.TranscriptPanel.showLoading("URL de áudio não encontrada");
+        setTimeout(() => window.TranscriptPanel.destroy(), 2000);
+        return;
+      }
+
+      // Listen for progress updates from background → offscreen
+      const progressHandler = (msg) => {
+        if (msg.action === "whisperProgress") {
+          window.TranscriptPanel.showLoading(msg.message);
+        }
+      };
+      chrome.runtime.onMessage.addListener(progressHandler);
+
+      window.TranscriptPanel.showLoading("Iniciando transcrição...");
+
+      // Send only the URL — offscreen document handles fetch, decode, resample, transcribe
+      const result = await new Promise((resolve) => {
+        safeSendMessage({
+          action: "transcribeAudio",
+          audioUrl: audioUrl,
+          language: "portuguese"
+        }, (res) => resolve(res));
+      });
+
+      chrome.runtime.onMessage.removeListener(progressHandler);
+
+      if (!result?.success) {
+        throw new Error(result?.error || "Transcription failed");
+      }
+
+      // Display results
+      window.TranscriptPanel.setLines(result.lines, videoEl);
+
+    } catch (err) {
+      console.error("Transcription error:", err);
+      showToast("Erro na transcrição: " + err.message);
+      if (window.TranscriptPanel.isOpen()) window.TranscriptPanel.destroy();
+    } finally {
+      isTranscribing = false;
+    }
+  }
+
+  // =====================
   // FLOATING BUTTON
   // =====================
   function createButton() {
@@ -163,6 +228,10 @@ if (window.__igToolkitCleanup) {
         <button class="ig-toolkit-dropdown-item" data-action="audio">
           <svg viewBox="0 0 24 24"><path d="M12 3v9.28c-.47-.17-.97-.28-1.5-.28C8.01 12 6 14.01 6 16.5S8.01 21 10.5 21c2.31 0 4.2-1.75 4.45-4H15V6h4V3h-7z"/></svg>
           Extrair Áudio
+        </button>
+        <button class="ig-toolkit-dropdown-item" data-action="transcribe">
+          <svg viewBox="0 0 24 24"><path d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H4V6h16v12zM6 10h2v2H6v-2zm0 4h8v2H6v-2zm10 0h2v2h-2v-2zm-6-4h8v2h-8v-2z"/></svg>
+          Transcrever
         </button>
       </div>
     `;
@@ -185,30 +254,35 @@ if (window.__igToolkitCleanup) {
 
       isDownloading = true;
       try {
-        showToast("Buscando mídia...");
         // When popup is open, find the video INSIDE the dialog, not the first video on page
         const dialog = document.querySelector("[role='dialog']");
         const firstVideo = dialog ? dialog.querySelector("video") : document.querySelector("video");
         const vidIdx = firstVideo ? getVideoIndex(firstVideo) : undefined;
-        const media = await extractMediaUrls(vidIdx, firstVideo);
 
-        if (!media) {
-          showToast("Não foi possível encontrar URLs de mídia");
-          return;
-        }
-
-        if (item.dataset.action === "video") {
-          if (!media.videoUrl) { showToast("URL de vídeo não encontrada"); return; }
-          await downloadVideo(media.videoUrl);
+        if (item.dataset.action === "transcribe") {
+          await transcribeVideo(firstVideo, vidIdx);
         } else {
-          // For audio: use audioUrl directly (DASH gives separate audio track!)
-          if (media.audioUrl) {
-            await downloadAudioFile(media.audioUrl);
-          } else if (media.videoUrl) {
-            // Fallback: extract audio from video
-            await extractAudio(media.videoUrl);
+          showToast("Buscando mídia...");
+          const media = await extractMediaUrls(vidIdx, firstVideo);
+
+          if (!media) {
+            showToast("Não foi possível encontrar URLs de mídia");
+            return;
+          }
+
+          if (item.dataset.action === "video") {
+            if (!media.videoUrl) { showToast("URL de vídeo não encontrada"); return; }
+            await downloadVideo(media.videoUrl);
           } else {
-            showToast("URL de áudio não encontrada");
+            // For audio: use audioUrl directly (DASH gives separate audio track!)
+            if (media.audioUrl) {
+              await downloadAudioFile(media.audioUrl);
+            } else if (media.videoUrl) {
+              // Fallback: extract audio from video
+              await extractAudio(media.videoUrl);
+            } else {
+              showToast("URL de áudio não encontrada");
+            }
           }
         }
       } catch (err) {
@@ -358,6 +432,10 @@ if (window.__igToolkitCleanup) {
           <svg viewBox="0 0 24 24"><path d="M12 3v9.28c-.47-.17-.97-.28-1.5-.28C8.01 12 6 14.01 6 16.5S8.01 21 10.5 21c2.31 0 4.2-1.75 4.45-4H15V6h4V3h-7z"/></svg>
           Áudio
         </button>
+        <button class="ig-toolkit-dropdown-item" data-action="transcribe">
+          <svg viewBox="0 0 24 24"><path d="M20 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm0 14H4V6h16v12zM6 10h2v2H6v-2zm0 4h8v2H6v-2zm10 0h2v2h-2v-2zm-6-4h8v2h-8v-2z"/></svg>
+          Transcrever
+        </button>
       </div>
     `;
     container.appendChild(btn);
@@ -384,25 +462,30 @@ if (window.__igToolkitCleanup) {
 
       isDownloading = true;
       try {
-        showToast("Buscando mídia...");
         const vidIdx = getVideoIndex(videoEl);
-        const media = await extractMediaUrls(vidIdx, videoEl);
 
-        if (!media) {
-          showToast("Não foi possível encontrar URLs de mídia");
-          return;
-        }
-
-        if (item.dataset.action === "video") {
-          if (!media.videoUrl) { showToast("URL de vídeo não encontrada"); return; }
-          await downloadVideo(media.videoUrl);
+        if (item.dataset.action === "transcribe") {
+          await transcribeVideo(videoEl, vidIdx);
         } else {
-          if (media.audioUrl) {
-            await downloadAudioFile(media.audioUrl);
-          } else if (media.videoUrl) {
-            await extractAudio(media.videoUrl);
+          showToast("Buscando mídia...");
+          const media = await extractMediaUrls(vidIdx, videoEl);
+
+          if (!media) {
+            showToast("Não foi possível encontrar URLs de mídia");
+            return;
+          }
+
+          if (item.dataset.action === "video") {
+            if (!media.videoUrl) { showToast("URL de vídeo não encontrada"); return; }
+            await downloadVideo(media.videoUrl);
           } else {
-            showToast("URL de áudio não encontrada");
+            if (media.audioUrl) {
+              await downloadAudioFile(media.audioUrl);
+            } else if (media.videoUrl) {
+              await extractAudio(media.videoUrl);
+            } else {
+              showToast("URL de áudio não encontrada");
+            }
           }
         }
       } catch (err) {

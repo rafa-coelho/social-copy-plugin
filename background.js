@@ -444,6 +444,34 @@ function cleanUrl(url) {
 }
 
 // =====================
+// OFFSCREEN DOCUMENT MANAGEMENT
+// =====================
+let offscreenCreating = null;
+
+async function ensureOffscreenDocument() {
+  // Check if already exists
+  const existingContexts = await chrome.runtime.getContexts({
+    contextTypes: ["OFFSCREEN_DOCUMENT"],
+    documentUrls: [chrome.runtime.getURL("offscreen.html")]
+  });
+  if (existingContexts.length > 0) return;
+
+  // Avoid race condition
+  if (offscreenCreating) {
+    await offscreenCreating;
+    return;
+  }
+
+  offscreenCreating = chrome.offscreen.createDocument({
+    url: "offscreen.html",
+    reasons: ["WORKERS"],
+    justification: "Run Whisper speech-to-text model in a Web Worker"
+  });
+  await offscreenCreating;
+  offscreenCreating = null;
+}
+
+// =====================
 // MESSAGE HANDLERS
 // =====================
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -581,5 +609,93 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       saveAs: false
     }, () => sendResponse({ success: true }));
     return true;
+  }
+
+  // =====================
+  // YOUTUBE: Get caption tracks via MAIN world injection
+  // =====================
+  if (message.action === "getYouTubeCaptionTracks") {
+    chrome.scripting.executeScript({
+      target: { tabId: sender.tab.id },
+      world: "MAIN",
+      func: () => {
+        try {
+          // Try ytInitialPlayerResponse first (set on page load)
+          var pr = window.ytInitialPlayerResponse;
+          if (!pr) {
+            // Fallback: try to get from ytplayer config
+            var cfg = window.ytplayer?.config?.args;
+            if (cfg?.raw_player_response) pr = cfg.raw_player_response;
+          }
+          if (!pr) {
+            // Fallback: try to find it in the movie_player element
+            var player = document.getElementById("movie_player");
+            if (player && player.getPlayerResponse) {
+              pr = player.getPlayerResponse();
+            }
+          }
+          if (pr?.captions?.playerCaptionsTracklistRenderer?.captionTracks) {
+            return pr.captions.playerCaptionsTracklistRenderer.captionTracks;
+          }
+          return null;
+        } catch(e) {
+          return null;
+        }
+      }
+    }).then(results => {
+      sendResponse({ success: true, tracks: results?.[0]?.result || null });
+    }).catch(err => {
+      sendResponse({ success: false, error: err.message });
+    });
+    return true;
+  }
+
+  // =====================
+  // YOUTUBE: Fetch caption content (JSON3 format)
+  // =====================
+  if (message.action === "fetchCaptions") {
+    const url = message.url + (message.url.includes("fmt=") ? "" : "&fmt=json3");
+    fetch(url)
+      .then(res => {
+        if (!res.ok) throw new Error("Caption fetch failed: " + res.status);
+        return res.json();
+      })
+      .then(data => sendResponse({ success: true, data }))
+      .catch(err => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  // =====================
+  // WHISPER: Transcribe audio via offscreen document
+  // =====================
+  if (message.action === "transcribeAudio") {
+    const tabId = sender.tab?.id;
+    ensureOffscreenDocument().then(() => {
+      chrome.runtime.sendMessage({
+        action: "offscreenTranscribe",
+        audioUrl: message.audioUrl,
+        language: message.language,
+        tabId: tabId
+      }, (res) => {
+        sendResponse(res);
+      });
+    }).catch(err => {
+      sendResponse({ success: false, error: err.message });
+    });
+    return true;
+  }
+
+  // =====================
+  // WHISPER: Forward progress from offscreen to content script tab
+  // =====================
+  if (message.action === "whisperProgress") {
+    if (message.tabId) {
+      chrome.tabs.sendMessage(message.tabId, {
+        action: "whisperProgress",
+        message: message.message,
+        progress: message.progress
+      });
+    }
+    return false;
   }
 });
