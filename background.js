@@ -31,6 +31,18 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 // Returns: { videoUrl, audioUrl } or null
 // =====================
 function extractVideoFromPage() {
+  // Shortcode of the reel the user actually asked for (set by the background
+  // script before injection). When present, we refuse any media data that
+  // can't be proven to belong to this reel — profile pages keep many reels
+  // in React state and a blind search can grab URLs from an unrelated one.
+  var targetShortcode = (typeof window.__igToolkitTargetShortcode === "string" && window.__igToolkitTargetShortcode) || null;
+
+  // "Do we already have the video we're allowed to use?"
+  // With a target: only a VERIFIED match counts. Without: any video_versions.
+  function haveTargetVideo(result) {
+    return targetShortcode ? !!result.verifiedVideo : !!result.hasVideoVersions;
+  }
+
   // Parse DASH MPD manifest XML and extract BaseURLs
   function parseMpd(mpdString) {
     try {
@@ -84,44 +96,67 @@ function extractVideoFromPage() {
     return null;
   }
 
-  // Deep search React data for video_versions (MP4 with audio) AND dash manifest
-  function deepSearch(obj, depth, visited, result) {
+  // Deep search React data for video_versions (MP4 with audio) AND dash manifest.
+  // `inTarget` = we are inside the subtree of the media object whose shortcode
+  // matches the reel the user asked for, so its data is trusted.
+  function deepSearch(obj, depth, visited, result, inTarget) {
     if (depth > 12 || !obj || typeof obj !== "object") return;
     if (visited.has(obj)) return;
     visited.add(obj);
 
     try {
+      // Media objects carry their own shortcode in `code`/`shortcode`
+      var ownCode = null;
+      if (typeof obj.code === "string" && /^[A-Za-z0-9_-]{5,}$/.test(obj.code)) {
+        ownCode = obj.code;
+      } else if (typeof obj.shortcode === "string" && /^[A-Za-z0-9_-]{5,}$/.test(obj.shortcode)) {
+        ownCode = obj.shortcode;
+      }
+
+      // Prune subtrees that provably belong to a DIFFERENT reel
+      if (targetShortcode && ownCode && ownCode !== targetShortcode) return;
+
+      var isTarget = inTarget || (targetShortcode && ownCode === targetShortcode);
+      // With a known target, only harvest data proven to belong to it;
+      // without a target, keep the old permissive behavior.
+      var canHarvest = !targetShortcode || isTarget;
+
       // Check for video_versions (complete MP4 with audio - PRIORITY)
       var versions = obj.video_versions || obj.videoVersions;
-      if (Array.isArray(versions) && versions.length > 0 && versions[0].url) {
+      if (canHarvest && Array.isArray(versions) && versions.length > 0 && versions[0].url) {
         // video_versions always takes priority over DASH video
         if (!result.videoUrl || result.isDash) {
           result.videoUrl = versions[0].url;
           result.isDash = false;
           result.hasVideoVersions = true;
+          if (isTarget) result.verifiedVideo = true;
         }
       }
 
-      // Grab media id/pk and shortcode for API fallback
-      // pk must be purely numeric (string or number)
-      if (!result.mediaId && obj.pk) {
-        var pkStr = String(obj.pk);
-        if (/^\d+$/.test(pkStr)) result.mediaId = pkStr;
+      if (canHarvest) {
+        // Grab media id/pk and shortcode for API fallback
+        // pk must be purely numeric (string or number)
+        if (!result.mediaId && obj.pk) {
+          var pkStr = String(obj.pk);
+          if (/^\d+$/.test(pkStr)) result.mediaId = pkStr;
+        }
+        if (!result.mediaId && obj.id && typeof obj.id === "string") {
+          var idPart = obj.id.split("_")[0];
+          if (/^\d+$/.test(idPart)) result.mediaId = idPart;
+        }
+        if (!result.shortcode && ownCode) result.shortcode = ownCode;
       }
-      if (!result.mediaId && obj.id && typeof obj.id === "string") {
-        var idPart = obj.id.split("_")[0];
-        if (/^\d+$/.test(idPart)) result.mediaId = idPart;
-      }
-      if (!result.shortcode && obj.code) result.shortcode = obj.code;
-      if (!result.shortcode && obj.shortcode) result.shortcode = obj.shortcode;
 
       // Check for dash manifest (for isolated audio track)
       var mpdFields = ["video_dash_manifest", "videoDashManifest", "dash_manifest", "dashManifest"];
       for (var f = 0; f < mpdFields.length; f++) {
-        if (typeof obj[mpdFields[f]] === "string" && obj[mpdFields[f]].includes("<MPD")) {
+        if (canHarvest && typeof obj[mpdFields[f]] === "string" && obj[mpdFields[f]].includes("<MPD")) {
           var parsed = parseMpd(obj[mpdFields[f]]);
           if (parsed) {
-            if (parsed.audioUrl && !result.audioUrl) result.audioUrl = parsed.audioUrl;
+            if (parsed.audioUrl && !result.audioUrl) {
+              result.audioUrl = parsed.audioUrl;
+              if (isTarget) result.verifiedAudio = true;
+            }
             if (!result.dashVideoUrl && parsed.videoUrl) result.dashVideoUrl = parsed.videoUrl;
           }
         }
@@ -131,15 +166,18 @@ function extractVideoFromPage() {
       var keys = Object.keys(obj);
       for (var i = 0; i < keys.length; i++) {
         var val = obj[keys[i]];
-        if (typeof val === "string" && val.includes("<MPD")) {
+        if (canHarvest && typeof val === "string" && val.includes("<MPD")) {
           var parsed = parseMpd(val);
           if (parsed) {
-            if (parsed.audioUrl && !result.audioUrl) result.audioUrl = parsed.audioUrl;
+            if (parsed.audioUrl && !result.audioUrl) {
+              result.audioUrl = parsed.audioUrl;
+              if (isTarget) result.verifiedAudio = true;
+            }
             if (!result.dashVideoUrl && parsed.videoUrl) result.dashVideoUrl = parsed.videoUrl;
           }
         }
         if (typeof val === "object" && val !== null) {
-          deepSearch(val, depth + 1, visited, result);
+          deepSearch(val, depth + 1, visited, result, isTarget);
         }
       }
     } catch(e) {}
@@ -171,8 +209,8 @@ function extractVideoFromPage() {
           state = state.next;
         }
       }
-      // Stop early if we have video_versions
-      if (result.hasVideoVersions) break;
+      // Stop early if we have a usable video
+      if (haveTargetVideo(result)) break;
       node = node.return;
     }
   }
@@ -180,7 +218,7 @@ function extractVideoFromPage() {
   // Walk DOWN a fiber tree (child/sibling) to find video data
   function walkFiberDown(node, result, visited, depth) {
     if (!node || depth > 15) return;
-    if (result.hasVideoVersions) return;
+    if (haveTargetVideo(result)) return;
 
     if (node.memoizedProps) {
       deepSearch(node.memoizedProps, 0, visited, result);
@@ -226,18 +264,18 @@ function extractVideoFromPage() {
       if (result.videoUrl || result.audioUrl) break;
     }
 
-    // If we don't have video_versions yet, try broader searches:
-    var needsBroaderSearch = !result.hasVideoVersions;
+    // If we don't have a usable video yet, try broader searches:
+    var needsBroaderSearch = !haveTargetVideo(result);
 
     // 1. Search from dialog/modal container (popup overlay) — walk UP and DOWN
     if (needsBroaderSearch) {
       var dialogs = document.querySelectorAll("[role='dialog']");
-      for (var d = 0; d < dialogs.length && !result.hasVideoVersions; d++) {
+      for (var d = 0; d < dialogs.length && !haveTargetVideo(result); d++) {
         console.log("Searching dialog fiber tree (up)...");
         walkFiberTree(dialogs[d], result);
 
         // Also walk DOWN from dialog's fiber root to find video data
-        if (!result.hasVideoVersions) {
+        if (!haveTargetVideo(result)) {
           var dialogFiberKey = Object.keys(dialogs[d]).find(function(k) {
             return k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$");
           });
@@ -251,22 +289,22 @@ function extractVideoFromPage() {
     }
 
     // 2. Search from article elements containing videos
-    if (!result.hasVideoVersions) {
+    if (!haveTargetVideo(result)) {
       for (var i = startIdx; i < endIdx && i < videos.length; i++) {
         var article = videos[i].closest("article");
         if (article) {
           console.log("Searching article fiber tree...");
           walkFiberTree(article, result);
-          if (result.hasVideoVersions) break;
+          if (haveTargetVideo(result)) break;
         }
       }
     }
 
     // 3. Walk up ALL parent elements of the video (they may have __reactProps with video data)
-    if (!result.hasVideoVersions) {
+    if (!haveTargetVideo(result)) {
       for (var i = startIdx; i < endIdx && i < videos.length; i++) {
         var parent = videos[i].parentElement;
-        for (var p = 0; p < 20 && parent && !result.hasVideoVersions; p++) {
+        for (var p = 0; p < 20 && parent && !haveTargetVideo(result); p++) {
           // Check __reactProps$xxx on parent elements
           var propsKey = Object.keys(parent).find(function(k) {
             return k.startsWith("__reactProps$");
@@ -277,21 +315,21 @@ function extractVideoFromPage() {
           walkFiberTree(parent, result);
           parent = parent.parentElement;
         }
-        if (result.hasVideoVersions) break;
+        if (haveTargetVideo(result)) break;
       }
     }
 
     // 4. Search from the overlay layers Instagram creates for popups
-    if (!result.hasVideoVersions) {
+    if (!haveTargetVideo(result)) {
       var layers = document.querySelectorAll("[class*='overlay'], [class*='modal'], [class*='layer'], [class*='Dialog']");
-      for (var l = 0; l < layers.length && !result.hasVideoVersions; l++) {
+      for (var l = 0; l < layers.length && !haveTargetVideo(result); l++) {
         console.log("Searching overlay/layer fiber tree...");
         walkFiberTree(layers[l], result);
       }
     }
 
     // 5. Last resort: search from React root
-    if (!result.hasVideoVersions) {
+    if (!haveTargetVideo(result)) {
       var root = document.getElementById("react-root") || document.getElementById("mount_0_0_") || document.querySelector("#react-root");
       if (root) {
         console.log("Searching React root fiber tree...");
@@ -309,7 +347,10 @@ function extractVideoFromPage() {
   }
 
   console.log("extractVideoFromPage result:", JSON.stringify({
+    targetShortcode: targetShortcode,
     hasVideoVersions: !!result.hasVideoVersions,
+    verifiedVideo: !!result.verifiedVideo,
+    verifiedAudio: !!result.verifiedAudio,
     isDash: !!result.isDash,
     hasVideoUrl: !!result.videoUrl,
     hasAudioUrl: !!result.audioUrl,
@@ -477,24 +518,28 @@ async function ensureOffscreenDocument() {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Extract video/audio URLs using MAIN world script injection
   if (message.action === "extractVideoUrl") {
-    // Set the video index before running extraction
-    const setIndex = message.videoIndex !== undefined
-      ? chrome.scripting.executeScript({
-          target: { tabId: sender.tab.id },
-          world: "MAIN",
-          func: (idx) => { window.__igToolkitVideoIndex = idx; },
-          args: [message.videoIndex]
-        })
-      : chrome.scripting.executeScript({
-          target: { tabId: sender.tab.id },
-          world: "MAIN",
-          func: () => { delete window.__igToolkitVideoIndex; }
-        });
+    // Set the video index AND the target shortcode before running extraction.
+    // The target shortcode lets the MAIN-world extractor reject media data
+    // belonging to other reels kept in React state (profile grids etc.).
+    const setContext = chrome.scripting.executeScript({
+      target: { tabId: sender.tab.id },
+      world: "MAIN",
+      func: (idx, sc) => {
+        if (typeof idx === "number") window.__igToolkitVideoIndex = idx;
+        else delete window.__igToolkitVideoIndex;
+        if (sc) window.__igToolkitTargetShortcode = sc;
+        else delete window.__igToolkitTargetShortcode;
+      },
+      args: [
+        typeof message.videoIndex === "number" ? message.videoIndex : null,
+        message.shortcode || null
+      ]
+    });
 
     const tabId = sender.tab.id;
     const shortcodeFromContent = message.shortcode;
 
-    setIndex.then(() => chrome.scripting.executeScript({
+    setContext.then(() => chrome.scripting.executeScript({
       target: { tabId },
       world: "MAIN",
       func: extractVideoFromPage
@@ -502,28 +547,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const data = results?.[0]?.result || {};
       console.log("React data:", JSON.stringify(data));
 
+      // When a target shortcode was known, the extractor only returns URLs
+      // proven to belong to that reel — so a missing URL here means
+      // "not found", never "found the wrong reel".
       const audioUrl = cleanUrl(data.audioUrl);
-      const shortcode = data.shortcode || shortcodeFromContent;
+      const shortcode = shortcodeFromContent || data.shortcode;
       const mediaId = data.mediaId;
       let videoUrl = cleanUrl(data.videoUrl);
       const hasVideoVersions = data.hasVideoVersions;
 
-      // If shortcode from URL differs from what React found, the React data might be wrong
-      const shortcodeMismatch = shortcodeFromContent && data.shortcode && shortcodeFromContent !== data.shortcode;
-      if (shortcodeMismatch) {
-        console.log("Shortcode mismatch! URL:", shortcodeFromContent, "React:", data.shortcode, "— will re-fetch");
-      }
-
-      // Try API when we don't have video_versions OR when shortcode mismatches
-      if ((!hasVideoVersions || shortcodeMismatch) && (mediaId || shortcode)) {
-        const useShortcode = shortcodeFromContent || shortcode;
-        console.log("Fetching complete MP4 via page fetch. shortcode:", useShortcode);
+      // Fall back to fetching the reel page directly (correct by construction,
+      // since it's fetched by shortcode) when fiber data didn't give us a
+      // complete MP4 for the requested reel.
+      if (!hasVideoVersions && (mediaId || shortcode)) {
+        console.log("Fetching complete MP4 via page fetch. shortcode:", shortcode);
         try {
           const apiResults = await chrome.scripting.executeScript({
             target: { tabId },
             world: "MAIN",
             func: fetchCompleteVideoFromApi,
-            args: [shortcodeMismatch ? null : (mediaId || null), shortcodeFromContent || shortcode || null]
+            args: [mediaId || null, shortcode || null]
           });
           const apiUrl = apiResults?.[0]?.result;
           console.log("API returned:", apiUrl);
