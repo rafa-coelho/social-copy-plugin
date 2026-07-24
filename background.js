@@ -655,60 +655,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   // =====================
-  // YOUTUBE: Get caption tracks via MAIN world injection
-  // =====================
-  if (message.action === "getYouTubeCaptionTracks") {
-    chrome.scripting.executeScript({
-      target: { tabId: sender.tab.id },
-      world: "MAIN",
-      func: () => {
-        try {
-          // Try ytInitialPlayerResponse first (set on page load)
-          var pr = window.ytInitialPlayerResponse;
-          if (!pr) {
-            // Fallback: try to get from ytplayer config
-            var cfg = window.ytplayer?.config?.args;
-            if (cfg?.raw_player_response) pr = cfg.raw_player_response;
-          }
-          if (!pr) {
-            // Fallback: try to find it in the movie_player element
-            var player = document.getElementById("movie_player");
-            if (player && player.getPlayerResponse) {
-              pr = player.getPlayerResponse();
-            }
-          }
-          if (pr?.captions?.playerCaptionsTracklistRenderer?.captionTracks) {
-            return pr.captions.playerCaptionsTracklistRenderer.captionTracks;
-          }
-          return null;
-        } catch(e) {
-          return null;
-        }
-      }
-    }).then(results => {
-      sendResponse({ success: true, tracks: results?.[0]?.result || null });
-    }).catch(err => {
-      sendResponse({ success: false, error: err.message });
-    });
-    return true;
-  }
-
-  // =====================
-  // YOUTUBE: Fetch caption content (JSON3 format)
-  // =====================
-  if (message.action === "fetchCaptions") {
-    const url = message.url + (message.url.includes("fmt=") ? "" : "&fmt=json3");
-    fetch(url)
-      .then(res => {
-        if (!res.ok) throw new Error("Caption fetch failed: " + res.status);
-        return res.json();
-      })
-      .then(data => sendResponse({ success: true, data }))
-      .catch(err => sendResponse({ success: false, error: err.message }));
-    return true;
-  }
-
-  // =====================
   // WHISPER: Transcribe audio via offscreen document
   // =====================
   if (message.action === "transcribeAudio") {

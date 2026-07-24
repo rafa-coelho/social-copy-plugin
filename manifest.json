@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Media Toolkit",
-  "version": "3.0",
-  "description": "Copy images, download videos, extract audio and transcribe from Instagram and YouTube",
+  "version": "3.1",
+  "description": "Copy images, download videos, extract audio and transcribe Instagram Reels — transcription runs 100% locally in your browser",
   "permissions": [
     "contextMenus",
     "activeTab",
@@ -15,9 +15,6 @@
     "https://*.cdninstagram.com/*",
     "https://*.fbcdn.net/*",
     "https://www.instagram.com/*",
-    "https://www.youtube.com/*",
-    "https://*.youtube.com/*",
-    "https://*.googlevideo.com/*",
     "https://huggingface.co/*",
     "https://cdn-lfs.huggingface.co/*",
     "https://cdn-lfs-us-1.huggingface.co/*"
@@ -33,11 +30,6 @@
       "matches": ["https://www.instagram.com/*"],
       "js": ["transcript-panel.js", "content.js"],
       "css": ["styles.css"]
-    },
-    {
-      "matches": ["https://www.youtube.com/*"],
-      "js": ["transcript-panel.js", "youtube-content.js"],
-      "css": ["youtube-styles.css"]
     }
   ],
   "icons": {
